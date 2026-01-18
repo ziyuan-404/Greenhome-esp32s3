@@ -1,3 +1,5 @@
+// --- WouoUI_WIFI.h ---
+
 #ifndef WOUOUI_WIFI_H
 #define WOUOUI_WIFI_H
 
@@ -42,6 +44,9 @@ private:
     void loadConfig();
     void reconnectMqtt();
     static void mqttCallback(char* topic, byte* payload, unsigned int length);
+    
+    // [新增] 动态生成带扫描结果的网页
+    String getWebPage(); 
 };
 
 extern WouoWIFI_Class WouoWIFI;

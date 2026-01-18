@@ -1358,10 +1358,22 @@ void WouoUI_Class::oled_init()
 void WouoUI_Class::begin() 
 {
   analogReadResolution(12); 
-  eeprom_init();
+  
+  eeprom_init(); // 1. 读取 EEPROM，此时 ui.param[WIFI_SET] 获取到了保存的模式(0, 1, 或 2)
   ui_init();
   oled_init();
   btn_init();
+
+  // [关键修复] 初始化 WiFi 模块并应用保存的模式
+  WouoWIFI.begin(); // 这会开启 Serial 串口，你就能看到打印信息了
+  
+  // 必须加个小延时确保串口准备好
+  delay(100); 
+  
+  // 根据读取到的配置，立刻启动 WiFi (否则开机就是关闭状态)
+  uint8_t saved_mode = ui.param[WIFI_SET];
+  Serial.print("[Boot] Restoring WiFi Mode: "); Serial.println(saved_mode);
+  WouoWIFI.setMode(saved_mode);
 }
 
 void WouoUI_Class::loop() 
