@@ -1,0 +1,41 @@
+mqtt:
+  # 配置水泵开关
+  switch:
+    - name: "温室水泵"
+      unique_id: "greenhouse_pump_switch"
+      command_topic: "home/greenhouse/pump/set"
+      state_topic: "home/greenhouse/pump/state"
+      payload_on: "ON"
+      payload_off: "OFF"
+      state_on: "ON"
+      state_off: "OFF"
+      retain: false
+
+  # 配置传感器
+  sensor:
+    - name: "温室温度"
+      unique_id: "greenhouse_temp"
+      state_topic: "home/greenhouse/temp"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      
+    - name: "温室湿度"
+      unique_id: "greenhouse_hum"
+      state_topic: "home/greenhouse/hum"
+      unit_of_measurement: "%"
+      device_class: humidity
+
+    - name: "土壤湿度"
+      unique_id: "greenhouse_soil"
+      state_topic: "home/greenhouse/soil"
+      unit_of_measurement: "%"
+      icon: mdi:water-percent
+
+    - name: "光照强度"
+      unique_id: "greenhouse_light"
+      state_topic: "home/greenhouse/light"
+      unit_of_measurement: "%"
+      icon: mdi:brightness-6
+
+
+// 旋钮填入:home/greenhouse/pump/set 2步 初始位置0 分隔点0.5 每步60 1 1
