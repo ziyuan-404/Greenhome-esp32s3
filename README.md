@@ -144,5 +144,5 @@ Although the current system successfully implements automated regulation using O
 
 ## **Credits**
 
-* **Project Developers**: Xavier d'Anselme, He Linfeng (ziyuan)  
+* **Project Developers**: ziyuan
 * **WouoUI Framework**: Originally created by RQNG, ported, modified, and deeply integrated into this project by ziyuan.
