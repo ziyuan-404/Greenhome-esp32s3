@@ -1,6 +1,6 @@
 # **GreenHome ESP32-S3 Smart Greenhouse & Ecosystem**
 
-[Chinese Version](https://github.com/ziyuan-404/Greenhome-esp32s3/blob/main/README_CH.md)
+[Chinese Version](https://github.com/ziyuan-404/Greenhome-esp32s3/blob/main/README-CH.md)
 
 ## **Project Overview**
 
