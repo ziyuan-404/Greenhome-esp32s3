@@ -144,5 +144,5 @@ mkdir emqx && tar \-zxvf emqx-5.x.x-ubuntu20.04-arm64.tar.gz \-C emqx
 
 ## **鸣谢**
 
-* **项目开发者**: Xavier d'Anselme, He Linfeng (ziyuan)  
+* **项目开发者**: ziyuan
 * **WouoUI 框架**: 原创作者为 RQNG，由 ziyuan 移植、修改并深度集成至本项目。
