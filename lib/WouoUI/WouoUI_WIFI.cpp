@@ -87,6 +87,7 @@ void WouoWIFI_Class::reconnectMqtt() {
     }
 }
 
+// ==================== [修复 4] WouoUI_WIFI.cpp 中的 MQTT 推送 ====================
 void WouoWIFI_Class::sendSensorData(float temp, float hum, int soil, int light) {
     if (mqttClient.connected()) {
         char buf[10];
@@ -94,7 +95,14 @@ void WouoWIFI_Class::sendSensorData(float temp, float hum, int soil, int light) 
         dtostrf(hum, 4, 1, buf);  mqttClient.publish("home/greenhouse/hum", buf);
         itoa(soil, buf, 10);      mqttClient.publish("home/greenhouse/soil", buf);
         itoa(light, buf, 10);     mqttClient.publish("home/greenhouse/light", buf);
-        mqttClient.publish("home/greenhouse/pump/state", digitalRead(PIN_RELAY) ? "ON" : "OFF");
+        
+        // [关键修复]：使用软件状态向 MQTT 汇报
+        bool pumpState = false;
+        if (g_dataMutex != NULL && xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            pumpState = g_sharedData.pump_state;
+            xSemaphoreGive(g_dataMutex);
+        }
+        mqttClient.publish("home/greenhouse/pump/state", pumpState ? "ON" : "OFF");
     }
 }
 

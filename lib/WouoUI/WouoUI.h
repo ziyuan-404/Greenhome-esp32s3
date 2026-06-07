@@ -28,7 +28,7 @@
 #define PIN_DHT     9    
 #define PIN_LIGHT   10
 #define PIN_SOIL    11  
-#define PIN_RELAY   21    
+#define PIN_RELAY   12  
 #define DHTTYPE     DHT11
 
 #define AUTO_PUMP_ON_LIMIT  30  

@@ -177,45 +177,51 @@ const char* WouoUI_Class::getStr(const M_SELECT &item) {
 
 // ==================== [修复2] 按键扫描函数：放宽长按判定时间，防丢包 ====================
 // ==================== [终极修复 1] 具备极高硬件宽容度的非阻塞消抖 ====================
+// ==================== [Debug版] 带有串口日志的按键扫描 ====================
 void WouoUI_Class::btn_scan() 
 {
   static unsigned long last_change_time = 0;
   static bool is_pressing = false;
   static unsigned long press_start_time = 0;
 
-  // 读取当前引脚电平 (LOW 表示被按下)
   bool current_sw = (digitalRead(KNOB_SW) == LOW);
 
-  // 核心逻辑：设置 50ms 的“绝对盲区”来屏蔽 EC11 脏乱的机械抖动
-  // 只要发生变化，50ms 内的所有电平波动全部无视！
   if (millis() - last_change_time > 50) 
   {
       if (current_sw != is_pressing) 
       {
-          last_change_time = millis(); // 记录状态改变时间，开启 50ms 盲区
-          is_pressing = current_sw;    // 确认新状态
+          last_change_time = millis(); 
+          is_pressing = current_sw;    
 
           if (is_pressing) 
           {
-              // 按键被确实按下，记录起始时间
               press_start_time = millis();
+              Serial.println("[BTN_SCAN] ⬇️ 按键被物理按下 (引脚变LOW)");
           } 
           else 
           {
-              // 按键被确实释放，计算按下时长
               unsigned long hold_time = millis() - press_start_time;
               uint8_t event_id;
 
-              // 宽容度调整：将短按阈值放宽至 600ms，避免稍微按重一点就被丢弃
+              Serial.printf("[BTN_SCAN] ⬆️ 按键物理释放 (引脚变HIGH), 持续时长: %lu ms\n", hold_time);
+
               if (hold_time < 600) {  
-                  event_id = BTN_ID_SP; // 短按
+                  event_id = BTN_ID_SP; 
+                  Serial.println("  -> 判定为: 短按 (SP)");
               } else {
-                  event_id = BTN_ID_LP; // 长按
+                  event_id = BTN_ID_LP; 
+                  Serial.println("  -> 判定为: 长按 (LP)");
               }
 
-              // 安全送入 FreeRTOS 队列
               if (g_btnQueue != NULL) {
-                  xQueueSend(g_btnQueue, &event_id, 0);
+                  // 尝试送入队列，并打印结果
+                  if (xQueueSend(g_btnQueue, &event_id, 0) == pdTRUE) {
+                      Serial.println("  -> ✅ 事件成功送入 FreeRTOS 队列!");
+                  } else {
+                      Serial.println("  -> ❌ 失败: FreeRTOS 队列已满，按键事件被丢弃!");
+                  }
+              } else {
+                  Serial.println("  -> ❌ 致命错误: g_btnQueue 未初始化!");
               }
           }
       }
@@ -752,10 +758,13 @@ void WouoUI_Class::sensor_show()
   u8g2.setFontDirection(0);
 
   // 4. 根据当前选择绘制不同的内容 (传感器 vs 继电器)
-  if (ui.select[ui.layer] == 4) 
-  {
-      // ============ 继电器页面 ============
-      bool relayState = digitalRead(PIN_RELAY);
+  if (ui.select[ui.layer] == 4) { 
+      // 【彻底修复】：在局部重新安全地获取一次最新的水泵状态
+      bool relayState = false;
+      if (g_dataMutex != NULL && xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          relayState = g_sharedData.pump_state;
+          xSemaphoreGive(g_dataMutex);
+      }
       
       // --- 绘制图表区 (ON/OFF 状态块) ---
       u8g2.setFont(u8g2_font_helvB24_tr); // 粗体大字
@@ -1255,6 +1264,7 @@ void WouoUI_Class::kpf_proc()
   }
 }
 
+// ==================== [修复2] 完善传感器页面的长按事件 ====================
 void WouoUI_Class::sensor_proc()
 {
   sensor_show(); 
@@ -1264,26 +1274,34 @@ void WouoUI_Class::sensor_proc()
       case BTN_ID_CW: 
       case BTN_ID_CC: 
         list_rotate_switch(); 
-        // 切换传感器时清空波形
         for(int i=0; i<128; i++) sensor.history[i] = 0;
         break;
       
-      case BTN_ID_LP: // 长按
-          // 如果当前选择的是第5项 (Index 4) -> 水泵
+      // ==================== [修复 1] sensor_proc 中的长按逻辑 ====================
+      case BTN_ID_LP: 
           if (ui.select[ui.layer] == 4) {
-              // 切换继电器状态
-              digitalWrite(PIN_RELAY, !digitalRead(PIN_RELAY));
-              // 强制刷新一次状态到历史记录，避免UI延迟
-              sensor.val_current = digitalRead(PIN_RELAY) ? 100 : 0;
-              // 增加蜂鸣器或串口反馈（可选）
-              // Serial.println("Relay Toggled");
-              break; // 这里的 break 阻止了 switch 继续向下执行 fallthrough
+              // 1. 安全获取当前软件记录的真实状态
+              bool current_state = false;
+              if (g_dataMutex != NULL && xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                  current_state = g_sharedData.pump_state;
+                  xSemaphoreGive(g_dataMutex);
+              }
+              
+              // 2. 翻转状态并执行物理动作
+              bool new_state = !current_state;
+              digitalWrite(PIN_RELAY, new_state); 
+              
+              // 3. 将新状态立刻写回共享数据
+              if (g_dataMutex != NULL && xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                  g_sharedData.pump_state = new_state;
+                  xSemaphoreGive(g_dataMutex);
+              }
+              
+              Serial.printf("[PUMP] 手动切换状态为: %s\n", new_state ? "ON" : "OFF");
+              break; 
           }
-          // 如果不是水泵页面，长按则执行退出操作 (fallthrough)
-          // 注意：这里没有 break，会自然滑落到 BTN_ID_SP，从而执行退出。
-          // 这种写法在C语言中是允许的，但容易让人误解。
-          // 为了稳妥，这里显式写一下：
-          ui.index = M_MAIN;  
+
+          ui.index = M_MAIN; 
           ui.state = S_LAYER_OUT; 
           break;
 
@@ -1339,16 +1357,19 @@ void WouoUI_Class::about_proc()
 }
 
 // ==================== [修改] UI 统一事件分发处理核心 ====================
+// ==================== [Debug版] 带有串口日志的 UI 事件分发 ====================
 void WouoUI_Class::ui_proc()
 {
   uint8_t received_event;
-  btn.pressed = false; // 每一帧刷新前，重置 UI 点击信号
+  btn.pressed = false; 
 
-  // 非阻塞提取队列中的外部按键或旋转事件
   if (g_btnQueue != NULL && xQueueReceive(g_btnQueue, &received_event, 0) == pdTRUE) 
   {
+      Serial.printf("[UI_PROC] 📥 从队列收到事件 ID: %d\n", received_event);
+      
       if (received_event == BTN_ID_SLEEP) 
       {
+          Serial.println("  -> 处理系统息屏指令");
           if (!ui.sleep) 
           {
               ui.index = M_SLEEP;
@@ -1359,7 +1380,8 @@ void WouoUI_Class::ui_proc()
       {
           btn.id = received_event;
           btn.pressed = true;   
-          resetSleepTimer();    // 有效操作，给内核定时器“喂狗”
+          resetSleepTimer();    
+          Serial.println("  -> 触发 UI 菜单处理逻辑，并重置息屏倒计时");
       }
   }
 
