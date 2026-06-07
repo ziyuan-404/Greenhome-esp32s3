@@ -22,7 +22,7 @@
 
 #define KNOB_AIO   38
 #define KNOB_BIO   39
-#define KNOB_SW    40
+#define KNOB_SW    1
 
 // ***************** 温室传感器与执行器配置 *****************
 #define PIN_DHT     9    

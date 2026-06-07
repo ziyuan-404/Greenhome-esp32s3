@@ -176,42 +176,47 @@ const char* WouoUI_Class::getStr(const M_SELECT &item) {
 }
 
 // ==================== [修复2] 按键扫描函数：放宽长按判定时间，防丢包 ====================
+// ==================== [终极修复 1] 具备极高硬件宽容度的非阻塞消抖 ====================
 void WouoUI_Class::btn_scan() 
 {
-  static unsigned long press_start_time = 0;
+  static unsigned long last_change_time = 0;
   static bool is_pressing = false;
+  static unsigned long press_start_time = 0;
 
-  // 读取当前引脚电平 (引脚拉低 LOW 表示被按下)
+  // 读取当前引脚电平 (LOW 表示被按下)
   bool current_sw = (digitalRead(KNOB_SW) == LOW);
 
-  // 1. 按下边缘检测 + 10ms 物理硬消抖
-  if (current_sw && !is_pressing) {
-      delay(10); // 10ms 微小阻塞不会影响系统，但能完美过滤弹簧机械噪声
-      if (digitalRead(KNOB_SW) == LOW) {
-          is_pressing = true;
-          press_start_time = millis(); // 记录精准按下的时刻
-      }
-  } 
-  // 2. 释放边缘检测 + 10ms 物理硬消抖
-  else if (!current_sw && is_pressing) {
-      delay(10); 
-      if (digitalRead(KNOB_SW) == HIGH) {
-          is_pressing = false;
-          
-          // 计算总计按住的时间
-          unsigned long hold_time = millis() - press_start_time;
-          uint8_t event_id;
+  // 核心逻辑：设置 50ms 的“绝对盲区”来屏蔽 EC11 脏乱的机械抖动
+  // 只要发生变化，50ms 内的所有电平波动全部无视！
+  if (millis() - last_change_time > 50) 
+  {
+      if (current_sw != is_pressing) 
+      {
+          last_change_time = millis(); // 记录状态改变时间，开启 50ms 盲区
+          is_pressing = current_sw;    // 确认新状态
 
-          // 【核心修复】：将长短按的真实物理阈值调整为 500 毫秒
-          if (hold_time < 500) {  
-              event_id = BTN_ID_SP; // 短按 (< 0.5秒)
-          } else {
-              event_id = BTN_ID_LP; // 长按 (> 0.5秒)
-          }
+          if (is_pressing) 
+          {
+              // 按键被确实按下，记录起始时间
+              press_start_time = millis();
+          } 
+          else 
+          {
+              // 按键被确实释放，计算按下时长
+              unsigned long hold_time = millis() - press_start_time;
+              uint8_t event_id;
 
-          // 将清洗后的纯净事件安全送入 FreeRTOS 队列
-          if (g_btnQueue != NULL) {
-              xQueueSend(g_btnQueue, &event_id, 0);
+              // 宽容度调整：将短按阈值放宽至 600ms，避免稍微按重一点就被丢弃
+              if (hold_time < 600) {  
+                  event_id = BTN_ID_SP; // 短按
+              } else {
+                  event_id = BTN_ID_LP; // 长按
+              }
+
+              // 安全送入 FreeRTOS 队列
+              if (g_btnQueue != NULL) {
+                  xQueueSend(g_btnQueue, &event_id, 0);
+              }
           }
       }
   }
@@ -1185,6 +1190,8 @@ void WouoUI_Class::main_proc()
       case BTN_ID_CC: 
         tile_rotate_switch(); 
         break; 
+        
+      case BTN_ID_LP:
       case BTN_ID_SP: 
         switch (ui.select[ui.layer]) {
           case 0: ui.index = M_SLEEP;   ui.state = S_LAYER_OUT; break;
@@ -1342,7 +1349,6 @@ void WouoUI_Class::ui_proc()
   {
       if (received_event == BTN_ID_SLEEP) 
       {
-          // 捕获到来自后台定时器的息屏信号
           if (!ui.sleep) 
           {
               ui.index = M_SLEEP;
@@ -1351,9 +1357,8 @@ void WouoUI_Class::ui_proc()
       } 
       else 
       {
-          // 正常的旋转/短按/长按事件
           btn.id = received_event;
-          btn.pressed = true;   // 唤醒当前活动页面的事件响应逻辑
+          btn.pressed = true;   
           resetSleepTimer();    // 有效操作，给内核定时器“喂狗”
       }
   }
