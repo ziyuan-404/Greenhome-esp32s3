@@ -8,38 +8,48 @@
 #include "WouoUI_WIFI.h"
 #include <DHT.h>
 
+// ==================== [新增] FreeRTOS 核心组件头文件 ====================
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/timers.h>
+
 // ***************** 用户引脚配置 (ESP32-S3) *****************
-// 软件SPI屏幕引脚
 #define OLED_SCL   15 
 #define OLED_SDA   7
 #define OLED_RES   4
 #define OLED_DC    6
 #define OLED_CS    5
 
-// EC11 旋钮引脚
-#define KNOB_AIO   18 
-#define KNOB_BIO   8
-#define KNOB_SW    17
+#define KNOB_AIO   38
+#define KNOB_BIO   39
+#define KNOB_SW    1
 
 // ***************** 温室传感器与执行器配置 *****************
-#define PIN_DHT     42    // DHT11 数据引脚
-#define PIN_LIGHT   38    // 光敏电阻 AO引脚
-#define PIN_SOIL    45    // 土壤湿度 AO引脚
-#define PIN_RELAY   21    // 水泵继电器引脚
+#define PIN_DHT     9    
+#define PIN_LIGHT   10
+#define PIN_SOIL    11  
+#define PIN_RELAY   21    
 #define DHTTYPE     DHT11
 
-// 自动化控制阈值
-#define AUTO_PUMP_ON_LIMIT  30  // 土壤湿度低于 30% 自动开启
-#define AUTO_PUMP_OFF_LIMIT 60  // 土壤湿度高于 60% 自动关闭
+#define AUTO_PUMP_ON_LIMIT  30  
+#define AUTO_PUMP_OFF_LIMIT 60  
 
-/************************************* 结构体定义 *************************************/
+// ==================== [新增] 全局 FreeRTOS 句柄声明 ====================
+extern QueueHandle_t g_btnQueue;     // 旋钮/按键事件消息队列句柄
+extern TimerHandle_t g_sleepTimer;   // 自动息屏内核软件定时器句柄
+
+// ==================== [新增] 软件定时器辅助控制函数 ====================
+void resetSleepTimer();         // 喂狗函数：重置息屏定时器时间
+void updateSleepTimerPeriod();  // 动态更新函数：动态改变息屏周期
+
+// 结构体定义
 typedef struct MENU
 {
-  const char *en; // 英文内容
-  const char *cn; // 中文内容
+  const char *en; 
+  const char *cn; 
 } M_SELECT;
 
-/************************************* 定义页面 *************************************/
+// 定义页面
 enum 
 {
   M_WINDOW,
@@ -53,79 +63,84 @@ enum
         M_ABOUT,
 };
 
-//状态，初始化标签
+// 状态标签
 enum
 {
-  S_FADE,       //转场动画
-  S_WINDOW,     //弹窗初始化
-  S_LAYER_IN,   //层级初始化
-  S_LAYER_OUT,  //层级初始化
-  S_NONE,       //直接选择页面
+  S_FADE,       
+  S_WINDOW,     
+  S_LAYER_IN,   
+  S_LAYER_OUT,  
+  S_NONE,       
 };
 
-//UI变量宏
-#define   UI_DEPTH            20    //最深层级数
-#define   UI_MNUMB            100   //菜单数量
-#define   UI_PARAM            19    //参数数量
-
-// 功能宏定义
-#define   DISP_H              128   //屏幕高度
-#define   DISP_W              128   //屏幕宽度
+#define   UI_DEPTH            20    
+#define   UI_MNUMB            100   
+#define   UI_PARAM            19    
+#define   DISP_H              128   
+#define   DISP_W              128   
 
 // 参数索引
 enum 
 {
-  UI_LANG,      //语言设置 (0: EN, 1: CN) 
-  AUTO_SLP,     //自动息屏时间 (0:从不, 1:3min, 2:5min, 3:10min)
-  WIFI_SET,     //WiFi设置 (0:关, 1:STA, 2:AP) 
-  DISP_BRI,     //屏幕亮度
-  TILE_ANI,     //磁贴动画速度
-  LIST_ANI,     //列表动画速度
-  WIN_ANI,      //弹窗动画速度
-  SPOT_ANI,     //聚光动画速度
-  TAG_ANI,      //标签动画速度
-  FADE_ANI,     //消失动画速度
-  BTN_SPT,      //按键短按时长
-  BTN_LPT,      //按键长按时长
-  TILE_UFD,     //磁贴图标从头展开开关
-  LIST_UFD,     //菜单列表从头展开开关
-  TILE_LOOP,    //磁贴图标循环模式开关
-  LIST_LOOP,    //菜单列表循环模式开关
-  WIN_BOK,      //弹窗背景虚化开关
-  KNOB_DIR,     //旋钮方向切换开关
-  DARK_MODE,    //黑暗模式开关
-  
+  UI_LANG,      
+  AUTO_SLP,     // 息屏时间 (0:从不, 1:3min, 2:5min, 3:10min)
+  WIFI_SET,     
+  DISP_BRI,     
+  TILE_ANI,     
+  LIST_ANI,     
+  WIN_ANI,      
+  SPOT_ANI,     
+  TAG_ANI,      
+  FADE_ANI,     
+  BTN_SPT,      
+  BTN_LPT,      
+  TILE_UFD,     
+  LIST_UFD,     
+  TILE_LOOP,    
+  LIST_LOOP,    
+  WIN_BOK,      
+  KNOB_DIR,     
+  DARK_MODE,    
 };
 
-// 旋钮参数
 #define   KNOB_PARAM          4
 #define   KNOB_DISABLE        0
 #define   KNOB_ROT_VOL        1
 #define   KNOB_ROT_BRI        2
 enum 
 {
-  KNOB_ROT,       //睡眠下旋转旋钮的功能，0 禁用，1 音量，2 亮度
-  KNOB_COD,       //睡眠下短按旋钮输入的字符码，0 禁用
-  KNOB_ROT_P,     //旋转旋钮功能在单选框中选择的位置
-  KNOB_COD_P,     //字符码在单选框中选择的位置
+  KNOB_ROT,       
+  KNOB_COD,       
+  KNOB_ROT_P,     
+  KNOB_COD_P,     
 };
 
-// 断电保存
 #define   EEPROM_CHECK        11
 
-// 按键ID
-#define   BTN_ID_CC           0   //逆时针旋转
-#define   BTN_ID_CW           1   //顺时针旋转
-#define   BTN_ID_SP           2   //短按
-#define   BTN_ID_LP           3   //长按
+// ==================== [修改] 按键与内核事件 ID ====================
+#define   BTN_ID_CC           0   // 逆时针旋转
+#define   BTN_ID_CW           1   // 顺时针旋转
+#define   BTN_ID_SP           2   // 短按
+#define   BTN_ID_LP           3   // 长按
+#define   BTN_ID_SLEEP        4   // [新增] 内核定时器触发的息屏事件
 
-// 为了保持代码结构与原版一致，我们将变量封装在类中
+// 共享数据结构体 (用于多任务数据安全传输)
+typedef struct {
+    float temp;
+    float hum;
+    int soil;
+    int light;
+    bool pump_state;
+} SharedData_t;
+
+extern SharedData_t g_sharedData;
+extern SemaphoreHandle_t g_dataMutex;
+
 class WouoUI_Class {
 public:
     void begin();
     void loop();
 
-    // 将原本的结构体定义在类内部或作为成员
     struct UI_VARS {
       bool      init;
       uint8_t   num[UI_MNUMB];
@@ -168,12 +183,12 @@ public:
     } list;
 
     struct SENSOR_VARS {
-      int     history[128]; // 记录128个点的历史数据用于绘图
-      int     head_index;   // 循环缓冲区头指针
-      float   val_current;  // 当前值
+      int     history[128]; 
+      int     head_index;   
+      float   val_current;  
       float   text_bg_l; 
       float   text_bg_l_trg;
-      unsigned long last_read_time; // 读取间隔控制
+      unsigned long last_read_time; 
     } sensor;
 
     struct CHECK_BOX_VARS {
@@ -233,13 +248,8 @@ public:
     } volatile btn;
 
     DHT* dht;
-    // Buffer vars
     uint8_t   *buf_ptr;
     uint16_t  buf_len;
-    
-    //自动息屏计时器
-    unsigned long sleep_timer = 0;
-
 
 private:
     void oled_init();
@@ -277,10 +287,9 @@ private:
     void kpf_proc();
     void kpf_param_init();
     
-    // [修改] 传感器相关
-    void sensor_proc();       // 原 volt_proc
-    void sensor_param_init(); // 原 volt_param_init
-    void sensor_show();       // 原 volt_show
+    void sensor_proc();       
+    void sensor_param_init(); 
+    void sensor_show();       
     
     void setting_proc();
     void setting_param_init();
