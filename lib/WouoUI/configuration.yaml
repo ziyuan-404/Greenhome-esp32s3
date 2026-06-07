@@ -39,3 +39,4 @@ mqtt:
 
 
 // 旋钮填入:home/greenhouse/pump/set 2步 初始位置0 分隔点0.5 每步60 1 1
+// 文件路径:/data/data/com.termux/files/home/.local/share/tmoe-linux/containers
