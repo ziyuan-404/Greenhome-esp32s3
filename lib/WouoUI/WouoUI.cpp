@@ -178,45 +178,42 @@ const char* WouoUI_Class::getStr(const M_SELECT &item) {
 // ==================== [修复2] 按键扫描函数：放宽长按判定时间，防丢包 ====================
 void WouoUI_Class::btn_scan() 
 {
-  static unsigned long last_debounce_time = 0;
-  static bool btn_pressing = false; 
   static unsigned long press_start_time = 0;
+  static bool is_pressing = false;
 
-  btn.val = digitalRead(KNOB_SW);
-  
-  // 50ms 硬件物理去抖
-  if (btn.val != btn.val_last && (millis() - last_debounce_time > 50)) 
-  {
-    last_debounce_time = millis();
-    btn.val_last = btn.val;
+  // 读取当前引脚电平 (引脚拉低 LOW 表示被按下)
+  bool current_sw = (digitalRead(KNOB_SW) == LOW);
 
-    if (btn.val == LOW) 
-    {
-      btn_pressing = true;
-      press_start_time = millis();
-    } 
-    else if (btn.val == HIGH && btn_pressing) 
-    {
-      btn_pressing = false;
-      unsigned long press_duration = millis() - press_start_time;
-      uint8_t event_id = 0;
-
-      // 核心修复：现在的 millis() 精度极高，旧版默认的 300ms 很容易被普通按压触发
-      // 我们强制将长按的触发阈值保底提高到 450 毫秒，找回清脆的“短按”手感
-      unsigned long lpt_threshold = ui.param[BTN_LPT] * BTN_PARAM_TIMES;
-      if (lpt_threshold < 450) lpt_threshold = 450; 
-
-      if (press_duration < lpt_threshold)  
-        event_id = BTN_ID_SP; // 短按
-      else  
-        event_id = BTN_ID_LP; // 长按
-
-      if (g_btnQueue != NULL) 
-      {
-        // 即使碰到极端情况队满，也允许等待最多 10ms 强制推入队列，确保按键必达
-        xQueueSend(g_btnQueue, &event_id, pdMS_TO_TICKS(10));
+  // 1. 按下边缘检测 + 10ms 物理硬消抖
+  if (current_sw && !is_pressing) {
+      delay(10); // 10ms 微小阻塞不会影响系统，但能完美过滤弹簧机械噪声
+      if (digitalRead(KNOB_SW) == LOW) {
+          is_pressing = true;
+          press_start_time = millis(); // 记录精准按下的时刻
       }
-    }
+  } 
+  // 2. 释放边缘检测 + 10ms 物理硬消抖
+  else if (!current_sw && is_pressing) {
+      delay(10); 
+      if (digitalRead(KNOB_SW) == HIGH) {
+          is_pressing = false;
+          
+          // 计算总计按住的时间
+          unsigned long hold_time = millis() - press_start_time;
+          uint8_t event_id;
+
+          // 【核心修复】：将长短按的真实物理阈值调整为 500 毫秒
+          if (hold_time < 500) {  
+              event_id = BTN_ID_SP; // 短按 (< 0.5秒)
+          } else {
+              event_id = BTN_ID_LP; // 长按 (> 0.5秒)
+          }
+
+          // 将清洗后的纯净事件安全送入 FreeRTOS 队列
+          if (g_btnQueue != NULL) {
+              xQueueSend(g_btnQueue, &event_id, 0);
+          }
+      }
   }
 }
 
