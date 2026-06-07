@@ -71,10 +71,14 @@ SemaphoreHandle_t g_dataMutex = NULL;
 QueueHandle_t g_btnQueue = NULL;     
 TimerHandle_t g_sleepTimer = NULL;
 
+// ==================== [修复1] 硬件中断函数：增加旋转防抖，防止队列被塞满 ====================
 static void IRAM_ATTR knob_inter() 
 {
+  static unsigned long last_rot_time = 0; // 记录上次成功旋转的时间
+  
   WouoUI.btn.alv = digitalRead(KNOB_AIO);
   WouoUI.btn.blv = digitalRead(KNOB_BIO);
+  
   if (!WouoUI.btn.flag && WouoUI.btn.alv == LOW) 
   {
     WouoUI.btn.CW_1 = WouoUI.btn.blv;
@@ -88,21 +92,26 @@ static void IRAM_ATTR knob_inter()
 
     if (WouoUI.btn.CW_1 && WouoUI.btn.CW_2)
     {
-      event_id = WouoUI.ui.param[KNOB_DIR]; // 顺时针触发
+      event_id = WouoUI.ui.param[KNOB_DIR]; 
       is_valid_rotation = true;
     }
     if (WouoUI.btn.CW_1 == false && WouoUI.btn.CW_2 == false) 
     {
-      event_id = !WouoUI.ui.param[KNOB_DIR]; // 逆时针触发
+      event_id = !WouoUI.ui.param[KNOB_DIR]; 
       is_valid_rotation = true;
     }
 
-    // 如果旋转有效，将旋转事件直接塞入 FreeRTOS 队列中
-    if (is_valid_rotation && g_btnQueue != NULL) 
+    // 核心修复：限制两次有效旋转事件的最小间隔为 40 毫秒
+    // 彻底屏蔽机械抖动瞬间产生的垃圾事件，防止按键队列被恶意塞满
+    if (is_valid_rotation && (millis() - last_rot_time > 40)) 
     {
-      BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-      xQueueSendFromISR(g_btnQueue, &event_id, &xHigherPriorityTaskWoken);
-      portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // 强制上下文切换，提高响应实时性
+      last_rot_time = millis();
+      if (g_btnQueue != NULL) 
+      {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(g_btnQueue, &event_id, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); 
+      }
     }
     WouoUI.btn.flag = false;
   }
@@ -166,7 +175,7 @@ const char* WouoUI_Class::getStr(const M_SELECT &item) {
     return item.en; // 0 = 英文
 }
 
-// ==================== [修改] 按键消抖与长按扫描：使用 xQueue 发送按键值 ====================
+// ==================== [修复2] 按键扫描函数：放宽长按判定时间，防丢包 ====================
 void WouoUI_Class::btn_scan() 
 {
   static unsigned long last_debounce_time = 0;
@@ -175,6 +184,7 @@ void WouoUI_Class::btn_scan()
 
   btn.val = digitalRead(KNOB_SW);
   
+  // 50ms 硬件物理去抖
   if (btn.val != btn.val_last && (millis() - last_debounce_time > 50)) 
   {
     last_debounce_time = millis();
@@ -191,15 +201,20 @@ void WouoUI_Class::btn_scan()
       unsigned long press_duration = millis() - press_start_time;
       uint8_t event_id = 0;
 
-      if (press_duration < (ui.param[BTN_LPT] * BTN_PARAM_TIMES))  
+      // 核心修复：现在的 millis() 精度极高，旧版默认的 300ms 很容易被普通按压触发
+      // 我们强制将长按的触发阈值保底提高到 450 毫秒，找回清脆的“短按”手感
+      unsigned long lpt_threshold = ui.param[BTN_LPT] * BTN_PARAM_TIMES;
+      if (lpt_threshold < 450) lpt_threshold = 450; 
+
+      if (press_duration < lpt_threshold)  
         event_id = BTN_ID_SP; // 短按
       else  
         event_id = BTN_ID_LP; // 长按
 
-      // 将解析出的点击事件写入事件队列
       if (g_btnQueue != NULL) 
       {
-        xQueueSend(g_btnQueue, &event_id, 0);
+        // 即使碰到极端情况队满，也允许等待最多 10ms 强制推入队列，确保按键必达
+        xQueueSend(g_btnQueue, &event_id, pdMS_TO_TICKS(10));
       }
     }
   }
@@ -1417,8 +1432,8 @@ void WouoUI_Class::begin()
 {
   analogReadResolution(12); 
 
-  // 1. 创建 FreeRTOS 消息队列（缓冲区深度设为10，能完美容纳快旋时的多步高频中断）
-  g_btnQueue = xQueueCreate(10, sizeof(uint8_t));
+  // 1. 创建 FreeRTOS 消息队列（缓冲区深度设为20，能完美容纳快旋时的多步高频中断）
+  g_btnQueue = xQueueCreate(20, sizeof(uint8_t));
 
   eeprom_init();
   ui_init();

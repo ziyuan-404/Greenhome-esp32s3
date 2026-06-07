@@ -20,14 +20,14 @@
 #define OLED_DC    6
 #define OLED_CS    5
 
-#define KNOB_AIO   18 
-#define KNOB_BIO   8
-#define KNOB_SW    17
+#define KNOB_AIO   38
+#define KNOB_BIO   39
+#define KNOB_SW    40
 
 // ***************** 温室传感器与执行器配置 *****************
-#define PIN_DHT     42    
-#define PIN_LIGHT   38    
-#define PIN_SOIL    45    
+#define PIN_DHT     9    
+#define PIN_LIGHT   10
+#define PIN_SOIL    11  
 #define PIN_RELAY   21    
 #define DHTTYPE     DHT11
 
