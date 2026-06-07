@@ -63,11 +63,22 @@ U8G2_SH1107_PIMORONI_128X128_F_4W_HW_SPI u8g2(U8G2_R0, OLED_CS, OLED_DC, OLED_RE
 #define   VOLT_TEXT_BG_U_S    53                          
 #define   VOLT_TEXT_BG_H      33 
 
-// 中断函数 (ESP32需要IRAM_ATTR)
+// 全局变量定义
+SharedData_t g_sharedData = {0, 0, 0, 0, false};
+SemaphoreHandle_t g_dataMutex = NULL;
+
+// ==================== [新增] FreeRTOS 组件实例定义 ====================
+QueueHandle_t g_btnQueue = NULL;     
+TimerHandle_t g_sleepTimer = NULL;
+
+// ==================== [修复1] 硬件中断函数：增加旋转防抖，防止队列被塞满 ====================
 static void IRAM_ATTR knob_inter() 
 {
+  static unsigned long last_rot_time = 0; // 记录上次成功旋转的时间
+  
   WouoUI.btn.alv = digitalRead(KNOB_AIO);
   WouoUI.btn.blv = digitalRead(KNOB_BIO);
+  
   if (!WouoUI.btn.flag && WouoUI.btn.alv == LOW) 
   {
     WouoUI.btn.CW_1 = WouoUI.btn.blv;
@@ -76,17 +87,81 @@ static void IRAM_ATTR knob_inter()
   if (WouoUI.btn.flag && WouoUI.btn.alv) 
   {
     WouoUI.btn.CW_2 = !WouoUI.btn.blv;
+    uint8_t event_id = 0;
+    bool is_valid_rotation = false;
+
     if (WouoUI.btn.CW_1 && WouoUI.btn.CW_2)
-     {
-      WouoUI.btn.id = WouoUI.ui.param[KNOB_DIR];
-      WouoUI.btn.pressed = true;
+    {
+      event_id = WouoUI.ui.param[KNOB_DIR]; 
+      is_valid_rotation = true;
     }
     if (WouoUI.btn.CW_1 == false && WouoUI.btn.CW_2 == false) 
     {
-      WouoUI.btn.id = !WouoUI.ui.param[KNOB_DIR];
-      WouoUI.btn.pressed = true;
+      event_id = !WouoUI.ui.param[KNOB_DIR]; 
+      is_valid_rotation = true;
+    }
+
+    // 核心修复：限制两次有效旋转事件的最小间隔为 40 毫秒
+    // 彻底屏蔽机械抖动瞬间产生的垃圾事件，防止按键队列被恶意塞满
+    if (is_valid_rotation && (millis() - last_rot_time > 40)) 
+    {
+      last_rot_time = millis();
+      if (g_btnQueue != NULL) 
+      {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(g_btnQueue, &event_id, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); 
+      }
     }
     WouoUI.btn.flag = false;
+  }
+}
+
+// ==================== [新增] 软件定时器相关控制回调与辅助函数 ====================
+
+// 息屏定时器溢出回调函数（在内核守护任务中执行）
+void vSleepTimerCallback(TimerHandle_t xTimer) 
+{
+  uint8_t event_id = BTN_ID_SLEEP;
+  if (g_btnQueue != NULL) 
+  {
+    // 向队列发送息屏特殊事件，通知前台 UI 任务进入休眠
+    xQueueSend(g_btnQueue, &event_id, 0);
+  }
+}
+
+// 喂狗函数：每次检测到有效的用户旋钮动作，都会重置内核定时器
+void resetSleepTimer() 
+{
+  if (g_sleepTimer != NULL && WouoUI.ui.param[AUTO_SLP] > 0 && !WouoUI.ui.sleep) 
+  {
+    xTimerReset(g_sleepTimer, 0);
+  }
+}
+
+// 当用户在菜单里修改了息屏时间参数时，动态修改内核定时器的溢出周期
+void updateSleepTimerPeriod() 
+{
+  if (g_sleepTimer != NULL) 
+  {
+    uint8_t index = WouoUI.ui.param[AUTO_SLP];
+    if (index == 0) 
+    {
+      xTimerStop(g_sleepTimer, 0); // “从不息屏”，关闭定时器
+    } 
+    else 
+    {
+      unsigned long ms = 0;
+      switch(index) 
+      {
+        case 1: ms = 3 * 60 * 1000; break;  // 3 分钟
+        case 2: ms = 5 * 60 * 1000; break;  // 5 分钟
+        case 3: ms = 10 * 60 * 1000; break; // 10 分钟
+      }
+      // 动态更新内核定时器周期并启动
+      xTimerChangePeriod(g_sleepTimer, pdMS_TO_TICKS(ms), 0);
+      xTimerStart(g_sleepTimer, 0);
+    }
   }
 }
 
@@ -100,29 +175,50 @@ const char* WouoUI_Class::getStr(const M_SELECT &item) {
     return item.en; // 0 = 英文
 }
 
+// ==================== [修复2] 按键扫描函数：放宽长按判定时间，防丢包 ====================
+// ==================== [终极修复 1] 具备极高硬件宽容度的非阻塞消抖 ====================
 void WouoUI_Class::btn_scan() 
 {
-  btn.val = digitalRead(KNOB_SW);
-  if (btn.val != btn.val_last)
-  {
-    btn.val_last = btn.val;
-    delay(ui.param[BTN_SPT] * BTN_PARAM_TIMES);
-    btn.val = digitalRead(KNOB_SW);
-    if (btn.val == LOW)
-    {
-      // [新增] 任何按键动作都重置息屏计时
-      sleep_timer = millis();
+  static unsigned long last_change_time = 0;
+  static bool is_pressing = false;
+  static unsigned long press_start_time = 0;
 
-      btn.pressed = true;
-      btn.count = 0;
-      while (!digitalRead(KNOB_SW))
+  // 读取当前引脚电平 (LOW 表示被按下)
+  bool current_sw = (digitalRead(KNOB_SW) == LOW);
+
+  // 核心逻辑：设置 50ms 的“绝对盲区”来屏蔽 EC11 脏乱的机械抖动
+  // 只要发生变化，50ms 内的所有电平波动全部无视！
+  if (millis() - last_change_time > 50) 
+  {
+      if (current_sw != is_pressing) 
       {
-        btn.count++;
-        delay(1);
+          last_change_time = millis(); // 记录状态改变时间，开启 50ms 盲区
+          is_pressing = current_sw;    // 确认新状态
+
+          if (is_pressing) 
+          {
+              // 按键被确实按下，记录起始时间
+              press_start_time = millis();
+          } 
+          else 
+          {
+              // 按键被确实释放，计算按下时长
+              unsigned long hold_time = millis() - press_start_time;
+              uint8_t event_id;
+
+              // 宽容度调整：将短按阈值放宽至 600ms，避免稍微按重一点就被丢弃
+              if (hold_time < 600) {  
+                  event_id = BTN_ID_SP; // 短按
+              } else {
+                  event_id = BTN_ID_LP; // 长按
+              }
+
+              // 安全送入 FreeRTOS 队列
+              if (g_btnQueue != NULL) {
+                  xQueueSend(g_btnQueue, &event_id, 0);
+              }
+          }
       }
-      if (btn.count < ui.param[BTN_LPT] * BTN_PARAM_TIMES)  btn.id = BTN_ID_SP;
-      else  btn.id = BTN_ID_LP;
-    }
   }
 }
 
@@ -156,7 +252,7 @@ void WouoUI_Class::ui_param_init()
   ui.param[AUTO_SLP]  = 1;        // 默认3分钟
   ui.param[WIFI_SET]  = 0;        // 默认关闭
   ui.param[DISP_BRI]  = 255;      //屏幕亮度
-  ui.param[TILE_ANI]  = 30;       //磁贴动画速度
+  ui.param[TILE_ANI]  = 50;       //磁贴动画速度
   ui.param[LIST_ANI]  = 60;       //列表动画速度
   ui.param[WIN_ANI]   = 25;       //弹窗动画速度
   ui.param[SPOT_ANI]  = 50;       //聚光动画速度
@@ -243,8 +339,6 @@ void WouoUI_Class::ui_init()
   tile_param_init(); 
   tile.icon_x = tile.icon_x_trg;
   tile.icon_y = tile.icon_y_trg;
-  
-  sleep_timer = millis(); 
 
   knob.param[0] = KNOB_DISABLE;
   knob.param[1] = KNOB_DISABLE;
@@ -620,47 +714,33 @@ void WouoUI_Class::sensor_show()
   // 2. 绘制上方图表外框
   u8g2.drawFrame(0, 0, WAVE_BOX_W, WAVE_BOX_H);
   
-  // 3. 数据读取与自动化处理 (1秒一次)
-  // 使用静态变量记录上一次的湿度状态，实现边缘触发，避免与手动控制冲突
-  static bool last_is_dry = false; 
-
-  if (millis() - sensor.last_read_time > 1000) {
-      sensor.last_read_time = millis();
+  // 3. 从后台任务安全获取最新数据 (代替原来的硬件读取)
+  static unsigned long last_update_time = 0;
+  if (millis() - last_update_time > 1000) {
+      last_update_time = millis();
       
-      float t = dht->readTemperature();
-      float h = dht->readHumidity();
-      if (isnan(t)) t = 0; 
-      if (isnan(h)) h = 0;
-      
-      int s_raw = analogRead(PIN_SOIL);
-      int l_raw = analogRead(PIN_LIGHT);
-      int s = map(s_raw, 0, 4095, 0, 100); 
-      int l = map(l_raw, 0, 4095, 0, 100);
+      float t = 0, h = 0;
+      int s = 0, l = 0;
+      bool pump = false;
 
-      // --- 继电器自动化控制逻辑 (边缘触发) ---
-      bool current_is_dry = (s < AUTO_PUMP_ON_LIMIT);
-      
-      // 只有当状态从“不干”变成“干”的那一瞬间，才自动开启水泵
-      // 这样开启后，用户依然可以手动关闭，不会被下一秒的循环强制打开
-      if (current_is_dry && !last_is_dry) {
-          digitalWrite(PIN_RELAY, HIGH);
-      }
-      last_is_dry = current_is_dry;
-      // ------------------------------------
-
-      // MQTT 发送
-      if (WouoWIFI.getMode() == 1) {
-          WouoWIFI.sendSensorData(t, h, s, l);
+      // 获取锁，拷贝数据后迅速释放，绝不阻塞 UI
+      if (g_dataMutex != NULL && xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          t = g_sharedData.temp;
+          h = g_sharedData.hum;
+          s = g_sharedData.soil;
+          l = g_sharedData.light;
+          pump = g_sharedData.pump_state;
+          xSemaphoreGive(g_dataMutex);
       }
 
       // 决定记录哪个数据进历史曲线
       float val_to_plot = 0;
       switch(ui.select[ui.layer]) {
-          case 0: val_to_plot = t; break; // Temp
-          case 1: val_to_plot = h; break; // Hum
-          case 2: val_to_plot = s; break; // Soil
-          case 3: val_to_plot = l; break; // Light
-          case 4: val_to_plot = digitalRead(PIN_RELAY) ? 100 : 0; break; // Pump
+          case 0: val_to_plot = t; break; 
+          case 1: val_to_plot = h; break; 
+          case 2: val_to_plot = s; break; 
+          case 3: val_to_plot = l; break; 
+          case 4: val_to_plot = pump ? 100 : 0; break; 
       }
       sensor.val_current = val_to_plot;
 
@@ -1042,50 +1122,31 @@ void WouoUI_Class::window_proc()
   if (btn.pressed && win.y == win.y_trg && win.y != WIN_Y_TRG)
   {
     btn.pressed = false;
-    sleep_timer = millis();
-
     bool isWifiWin = (win.value == &ui.param[WIFI_SET]);
-    bool isSpecial = (win.value == &ui.param[AUTO_SLP]) || (win.value == &ui.param[UI_LANG]) || isWifiWin;
+    bool isSleepWin = (win.value == &ui.param[AUTO_SLP]);
+    bool isSpecial = isSleepWin || (win.value == &ui.param[UI_LANG]) || isWifiWin;
 
     if (isSpecial) {
         switch (btn.id)
         {
             case BTN_ID_CW: 
-               // 向右旋转，内容向左飞入效果 (偏移量设为正数，然后回归0)
-               win.option_offset = 15; 
-               win.option_offset_trg = 0;
-               
-               if (*win.value < win.max) *win.value += win.step; 
-               else *win.value = win.min; 
+               win.option_offset = 15; win.option_offset_trg = 0;
+               if (*win.value < win.max) *win.value += win.step; else *win.value = win.min; 
                if (!isWifiWin) eeprom.change = true; 
+               if (isSleepWin) updateSleepTimerPeriod(); // [新增] 动态更改时间后，重置定时器参数
                break;
-
             case BTN_ID_CC: 
-               // 向左旋转，内容向右飞入效果
-               win.option_offset = -15; 
-               win.option_offset_trg = 0;
-
-               if (*win.value > win.min) *win.value -= win.step; 
-               else *win.value = win.max; 
+               win.option_offset = -15; win.option_offset_trg = 0;
+               if (*win.value > win.min) *win.value -= win.step; else *win.value = win.max; 
                if (!isWifiWin) eeprom.change = true; 
+               if (isSleepWin) updateSleepTimerPeriod(); // [新增] 动态更改时间后，重置定时器参数
                break;
-
             case BTN_ID_LP: 
-               if (isWifiWin) {
-                   WouoWIFI.setMode(*win.value);
-                   eeprom.change = true;
-               } else {
-                   win.y_trg = WIN_Y_TRG; 
-               }
-               break;
-               
-            case BTN_ID_SP: 
-               win.y_trg = WIN_Y_TRG; 
-               break;
+               if (isWifiWin) { WouoWIFI.setMode(*win.value); eeprom.change = true; } else { win.y_trg = WIN_Y_TRG; } break;
+            case BTN_ID_SP: win.y_trg = WIN_Y_TRG; break;
         }
     } 
     else {
-        // 普通数值窗口
         switch (btn.id)
         {
           case BTN_ID_CW: if (*win.value < win.max)  *win.value += win.step;  eeprom.change = true;  break;
@@ -1101,25 +1162,21 @@ void WouoUI_Class::sleep_proc()
   while (ui.sleep)
   {
     btn_scan();
-    if (btn.pressed) { 
-        btn.pressed = false; 
-        switch (btn.id) {    
-            case BTN_ID_CW: break; // 旋钮不唤醒
-            case BTN_ID_CC: break; // 旋钮不唤醒
-            
-            // [修改 2] 增加短按唤醒逻辑
-            case BTN_ID_SP: 
-            case BTN_ID_LP: 
-                ui.index = M_MAIN;  
-                ui.state = S_LAYER_IN; 
-                u8g2.setPowerSave(0); 
-                ui.sleep = false; 
-                sleep_timer = millis(); // 唤醒时重置计时
-                break;
+    // 睡眠模式下，非阻塞从队列获取唤醒事件
+    uint8_t received_event;
+    if (g_btnQueue != NULL && xQueueReceive(g_btnQueue, &received_event, 0) == pdTRUE) 
+    {
+        if (received_event == BTN_ID_SP || received_event == BTN_ID_LP) 
+        {
+            ui.index = M_MAIN;  
+            ui.state = S_LAYER_IN; 
+            u8g2.setPowerSave(0); 
+            ui.sleep = false; 
+            updateSleepTimerPeriod(); // [新增] 唤醒后重新开启软件定时器
         }
     }
-    // 睡眠时保持 WiFi 后台运行
     WouoWIFI.loop(); 
+    delay(10); // 避免死循环跑满内核
   }
 }
 
@@ -1133,6 +1190,8 @@ void WouoUI_Class::main_proc()
       case BTN_ID_CC: 
         tile_rotate_switch(); 
         break; 
+        
+      case BTN_ID_LP:
       case BTN_ID_SP: 
         switch (ui.select[ui.layer]) {
           case 0: ui.index = M_SLEEP;   ui.state = S_LAYER_OUT; break;
@@ -1279,12 +1338,28 @@ void WouoUI_Class::about_proc()
   }
 }
 
+// ==================== [修改] UI 统一事件分发处理核心 ====================
 void WouoUI_Class::ui_proc()
 {
-  if (!ui.sleep && ui.param[AUTO_SLP] > 0) {
-      if (millis() - sleep_timer > getSleepTimeMS(ui.param[AUTO_SLP])) {
-          ui.index = M_SLEEP;
-          ui.state = S_LAYER_OUT; 
+  uint8_t received_event;
+  btn.pressed = false; // 每一帧刷新前，重置 UI 点击信号
+
+  // 非阻塞提取队列中的外部按键或旋转事件
+  if (g_btnQueue != NULL && xQueueReceive(g_btnQueue, &received_event, 0) == pdTRUE) 
+  {
+      if (received_event == BTN_ID_SLEEP) 
+      {
+          if (!ui.sleep) 
+          {
+              ui.index = M_SLEEP;
+              ui.state = S_LAYER_OUT;
+          }
+      } 
+      else 
+      {
+          btn.id = received_event;
+          btn.pressed = true;   
+          resetSleepTimer();    // 有效操作，给内核定时器“喂狗”
       }
   }
 
@@ -1301,11 +1376,10 @@ void WouoUI_Class::ui_proc()
       case M_WINDOW:      window_proc();            break;
       case M_SLEEP:       sleep_proc();             break;
       case M_MAIN:        main_proc();              break;
-      // case M_EDITOR:   editor_proc();            break; // [已删除]
       case M_KNOB:        knob_proc();              break;
       case M_KRF:         krf_proc();               break;
       case M_KPF:         kpf_proc();               break;
-      case M_SENSOR:      sensor_proc();            break; // [修改] 对应 M_SENSOR
+      case M_SENSOR:      sensor_proc();            break; 
       case M_SETTING:     setting_proc();           break;
       case M_ABOUT:       about_proc();             break;
     }
@@ -1355,33 +1429,26 @@ void WouoUI_Class::oled_init()
   buf_len = 8 * u8g2.getBufferTileHeight() * u8g2.getBufferTileWidth();
 }
 
+// ==================== [修改] 初始化：在此处完成队列与内核定时器的物理创建 ====================
 void WouoUI_Class::begin() 
 {
   analogReadResolution(12); 
-  
-  eeprom_init(); // 1. 读取 EEPROM，此时 ui.param[WIFI_SET] 获取到了保存的模式(0, 1, 或 2)
+
+  // 1. 创建 FreeRTOS 消息队列（缓冲区深度设为20，能完美容纳快旋时的多步高频中断）
+  g_btnQueue = xQueueCreate(20, sizeof(uint8_t));
+
+  eeprom_init();
   ui_init();
   oled_init();
   btn_init();
 
-  // [关键修复] 初始化 WiFi 模块并应用保存的模式
-  WouoWIFI.begin(); // 这会开启 Serial 串口，你就能看到打印信息了
-  
-  // 必须加个小延时确保串口准备好
-  delay(100); 
-  
-  // 根据读取到的配置，立刻启动 WiFi (否则开机就是关闭状态)
-  uint8_t saved_mode = ui.param[WIFI_SET];
-  Serial.print("[Boot] Restoring WiFi Mode: "); Serial.println(saved_mode);
-  WouoWIFI.setMode(saved_mode);
+  // 2. 创建 FreeRTOS 软件内核定时器（单次触发，第3个参数填 pdFALSE）
+  g_sleepTimer = xTimerCreate("SleepTimer", pdMS_TO_TICKS(3 * 60 * 1000), pdFALSE, (void*)0, vSleepTimerCallback);
+  updateSleepTimerPeriod(); // 根据读取到的 NVS 参数，拉起正确的初试运行周期
 }
 
 void WouoUI_Class::loop() 
 {
-  // 旋钮扫描 (会更新 sleep_timer)
-  btn_scan();
-  // WiFi 任务处理
-  WouoWIFI.loop(); 
-  // UI 刷新
-  ui_proc();
+  btn_scan(); // 执行去抖点击扫描
+  ui_proc();  // 执行前台渲染及事件消费
 }

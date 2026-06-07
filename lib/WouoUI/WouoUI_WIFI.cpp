@@ -3,12 +3,29 @@
 
 WouoWIFI_Class WouoWIFI;
 
-// MQTT 回调
+// 在 WouoUI_WIFI.cpp 顶部声明引入外部互斥锁和共享数据
+extern SharedData_t g_sharedData;
+extern SemaphoreHandle_t g_dataMutex;
+
+//生成动态网页内容，包含 WiFi 扫描结果和当前配置
 void WouoWIFI_Class::mqttCallback(char* topic, byte* payload, unsigned int length) {
     String msg;
     for (int i = 0; i < length; i++) msg += (char)payload[i];
-    if (msg == "ON") digitalWrite(PIN_RELAY, HIGH);
-    else if (msg == "OFF") digitalWrite(PIN_RELAY, LOW);
+    
+    bool newState = false;
+    if (msg == "ON") {
+        digitalWrite(PIN_RELAY, HIGH);
+        newState = true;
+    } else if (msg == "OFF") {
+        digitalWrite(PIN_RELAY, LOW);
+        newState = false;
+    }
+
+    // 同步更新给共享结构体
+    if (g_dataMutex != NULL && xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        g_sharedData.pump_state = newState;
+        xSemaphoreGive(g_dataMutex);
+    }
 }
 
 void WouoWIFI_Class::begin() {
