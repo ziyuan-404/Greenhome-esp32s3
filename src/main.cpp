@@ -14,7 +14,7 @@ void sensorTask(void *pvParameters) {
         if (isnan(t)) t = 0; 
         if (isnan(h)) h = 0;
         
-        int s = map(analogRead(PIN_SOIL), 0, 4095, 0, 100); 
+        int s = map(analogRead(PIN_SOIL), 4095, 0, 0, 100);
         int l = map(analogRead(PIN_LIGHT), 0, 4095, 0, 100);
 
         // [关键修复]：从共享变量读取当前状态，绝不依赖 digitalRead

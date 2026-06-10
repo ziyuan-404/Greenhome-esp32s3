@@ -32,6 +32,9 @@ void WouoWIFI_Class::begin() {
     Serial.begin(115200);
     Serial.println("\n[System] WouoUI WiFi Starting...");
 
+    // [新增] 创建 MQTT 互斥锁
+    _mqttMutex = xSemaphoreCreateMutex();
+
     pref.begin("wifi_conf", false);
     loadConfig();
     pinMode(PIN_RELAY, OUTPUT);
@@ -40,7 +43,6 @@ void WouoWIFI_Class::begin() {
     mqttClient.setClient(espClient);
     mqttClient.setCallback(mqttCallback);
     
-    // 初始状态完全关闭 WiFi
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
 }
@@ -58,30 +60,81 @@ void WouoWIFI_Class::loadConfig() {
 }
 
 void WouoWIFI_Class::loop() {
-    // [关键] 无论什么模式，只要 server 对象存在，就处理网页请求
+    // [修复] 如果系统正在切换模式或分配内存，强行截断后台任务执行
+    if (_wifiBusy) return;
+
     if (server) server->handleClient();
     
-    // STA 模式下的 MQTT 处理
     if (_mode == 1 && WiFi.status() == WL_CONNECTED) {
-        if (!mqttClient.connected()) {
-            reconnectMqtt();
+        bool conn = false;
+        
+        // [修复] 安全获取底层 MQTT 状态
+        if (_mqttMutex != NULL && xSemaphoreTake(_mqttMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            conn = mqttClient.connected();
+            xSemaphoreGive(_mqttMutex);
         }
-        mqttClient.loop();
+        
+        _mqtt_connected_flag = conn; // 更新缓存给 UI 用
+
+        if (!conn) {
+            reconnectMqtt();
+        } else {
+            // [修复] 安全执行协议栈循环
+            if (_mqttMutex != NULL && xSemaphoreTake(_mqttMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                mqttClient.loop();
+                xSemaphoreGive(_mqttMutex);
+            }
+        }
+    } else {
+        _mqtt_connected_flag = false;
     }
 }
 
 void WouoWIFI_Class::reconnectMqtt() {
     static unsigned long lastReconnectAttempt = 0;
     long now = millis();
+    
+    // 限制重连频率，每5秒最多尝试一次
     if (now - lastReconnectAttempt > 5000) {
         lastReconnectAttempt = now;
+        
+        // 确保已经分配到有效 IP
+        if (WiFi.localIP()[0] == 0) {
+            Serial.println("[MQTT] Waiting for valid IP...");
+            return; 
+        }
+
         if (mqtt_server.length() > 0) {
             Serial.print("[MQTT] Connecting to "); Serial.println(mqtt_server);
-            mqttClient.setServer(mqtt_server.c_str(), mqtt_port);
-            String clientId = "ESP32_GH_" + String(random(0xffff), HEX);
-            if (mqttClient.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str())) {
-                Serial.println("[MQTT] Connected");
-                mqttClient.subscribe("home/greenhouse/pump/set");
+            
+            // 限制底层 TCP 读写超时时间为 2 秒
+            espClient.setTimeout(2); 
+
+            if (_mqttMutex != NULL && xSemaphoreTake(_mqttMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                mqttClient.setServer(mqtt_server.c_str(), mqtt_port);
+                String clientId = "ESP32_GH_" + String(random(0xffff), HEX);
+                
+                // ==================== [终极修复] ====================
+                // 临时关闭 Core 0 的硬件看门狗 (WDT)
+                // 原因：当目标 IP 不可达时，底层的 TCP 握手可能会陷入超过 5 秒的底层自旋，
+                // 从而饿死 Core 0 的 IDLE 任务并触发 WDT 重启。临时关狗强行续命防重启。
+                disableCore0WDT();
+                
+                // 执行阻塞的连接请求
+                bool connected = mqttClient.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str());
+                
+                // 请求结束，立刻恢复 Core 0 的硬件看门狗
+                enableCore0WDT();
+                // ====================================================
+
+                if (connected) {
+                    Serial.println("[MQTT] Connected");
+                    mqttClient.subscribe("home/greenhouse/pump/set");
+                } else {
+                    Serial.print("[MQTT] Failed, rc=");
+                    Serial.println(mqttClient.state()); // 打印失败状态码
+                }
+                xSemaphoreGive(_mqttMutex);
             }
         }
     }
@@ -89,25 +142,33 @@ void WouoWIFI_Class::reconnectMqtt() {
 
 // ==================== [修复 4] WouoUI_WIFI.cpp 中的 MQTT 推送 ====================
 void WouoWIFI_Class::sendSensorData(float temp, float hum, int soil, int light) {
-    if (mqttClient.connected()) {
-        char buf[10];
-        dtostrf(temp, 4, 1, buf); mqttClient.publish("home/greenhouse/temp", buf);
-        dtostrf(hum, 4, 1, buf);  mqttClient.publish("home/greenhouse/hum", buf);
-        itoa(soil, buf, 10);      mqttClient.publish("home/greenhouse/soil", buf);
-        itoa(light, buf, 10);     mqttClient.publish("home/greenhouse/light", buf);
-        
-        // [关键修复]：使用软件状态向 MQTT 汇报
-        bool pumpState = false;
-        if (g_dataMutex != NULL && xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            pumpState = g_sharedData.pump_state;
-            xSemaphoreGive(g_dataMutex);
+    // [修复] 只有确认连接且能拿到锁时才推送，防止与 loop() 冲突
+    if (_mqtt_connected_flag) {
+        if (_mqttMutex != NULL && xSemaphoreTake(_mqttMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+            char buf[10];
+            dtostrf(temp, 4, 1, buf); mqttClient.publish("home/greenhouse/temp", buf);
+            dtostrf(hum, 4, 1, buf);  mqttClient.publish("home/greenhouse/hum", buf);
+            itoa(soil, buf, 10);      mqttClient.publish("home/greenhouse/soil", buf);
+            itoa(light, buf, 10);     mqttClient.publish("home/greenhouse/light", buf);
+            
+            bool pumpState = false;
+            if (g_dataMutex != NULL && xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                pumpState = g_sharedData.pump_state;
+                xSemaphoreGive(g_dataMutex);
+            }
+            mqttClient.publish("home/greenhouse/pump/state", pumpState ? "ON" : "OFF");
+            
+            xSemaphoreGive(_mqttMutex);
         }
-        mqttClient.publish("home/greenhouse/pump/state", pumpState ? "ON" : "OFF");
     }
 }
 
 void WouoWIFI_Class::setMode(uint8_t mode) {
     if (_mode == mode) return;
+    
+    // [修复] 锁定网络任务，防止 Core 0 访问即将被销毁的 WebServer 指针
+    _wifiBusy = true; 
+    delay(20); 
     
     Serial.print("[Mode] Switching to "); Serial.println(mode);
     _mode = mode;
@@ -115,6 +176,9 @@ void WouoWIFI_Class::setMode(uint8_t mode) {
     
     if (_mode == 1) setupSTA();
     else if (_mode == 2) setupAP();
+
+    // [修复] 释放网络任务
+    _wifiBusy = false; 
 }
 
 uint8_t WouoWIFI_Class::getMode() { return _mode; }
@@ -264,5 +328,5 @@ String WouoWIFI_Class::getIP() {
 }
 
 bool WouoWIFI_Class::isMqttConnected() {
-    return mqttClient.connected();
+    return _mqtt_connected_flag;
 }

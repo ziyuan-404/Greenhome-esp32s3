@@ -9,6 +9,10 @@
 #include <Preferences.h>
 #include <PubSubClient.h>
 
+// [新增] 引入 FreeRTOS 组件用于跨核保护
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
 class WouoWIFI_Class {
 public:
     void begin();
@@ -33,10 +37,17 @@ private:
     WiFiClient espClient;
     PubSubClient mqttClient;
 
-    // 配置变量
+    // ================= [修复缺失] 补回这些配置变量 =================
     String ssid, pass;
     String mqtt_server, mqtt_user, mqtt_pass;
     int mqtt_port;
+    // ==============================================================
+
+    // ================= 跨核并发保护相关变量 =================
+    volatile bool _wifiBusy = false;            // 标记是否正在销毁/重建网络对象
+    volatile bool _mqtt_connected_flag = false; // 缓存的 MQTT 状态，供高频 UI 读取
+    SemaphoreHandle_t _mqttMutex = NULL;        // MQTT 资源读写锁
+    // ========================================================
 
     void setupAP();
     void setupSTA();
@@ -45,7 +56,7 @@ private:
     void reconnectMqtt();
     static void mqttCallback(char* topic, byte* payload, unsigned int length);
     
-    // [新增] 动态生成带扫描结果的网页
+    // 动态生成带扫描结果的网页
     String getWebPage(); 
 };
 
